@@ -1,9 +1,15 @@
 package Almacenamiento;
 
+import estrategiasAsignacion.secuencial;
 import java.io.File;
 import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.FileAlreadyExistsException;
+import java.nio.file.Files;
+import java.util.Map;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 
 public class discoVirtual implements AutoCloseable {
 
@@ -16,6 +22,11 @@ public class discoVirtual implements AutoCloseable {
     private static final int BLOQUES_FCB = 32;
 
     public void crearDisco(String Nombre, long TamañoMB)
+            throws IOException {
+        crearDisco(Nombre, TamañoMB, null);
+    }
+
+    private void crearDisco(String Nombre, long TamañoMB, Path directorio)
             throws IOException {
 
         if (disco != null) {
@@ -33,7 +44,9 @@ public class discoVirtual implements AutoCloseable {
                     "El tamaño debe ser mayor que cero");
         }
 
-        File archivo = new File(Nombre);
+        File archivo = directorio == null
+                ? new File(Nombre)
+                : directorio.resolve(Nombre).toFile();
 
         if (archivo.exists()) {
             throw new IOException(
@@ -110,6 +123,49 @@ public class discoVirtual implements AutoCloseable {
             long tamañoMB,
             int tamañoBloque,
             int estrategia) throws IOException {
+        formatear(nombre, tamañoMB, tamañoBloque, estrategia, null, null);
+    }
+
+    public static void formatear(Path archivo, long tamañoMB, int tamañoBloque,
+            char[] contraseña, boolean reemplazar) throws IOException {
+        if (contraseña == null || contraseña.length == 0) {
+            throw new IllegalArgumentException("La contraseña de root es obligatoria");
+        }
+        prepararImagen(archivo, tamañoMB, tamañoBloque, 1, contraseña, reemplazar);
+    }
+
+    public static void reformatear(Path archivo, long tamañoMB,
+            int tamañoBloque, int estrategia) throws IOException {
+        prepararImagen(archivo, tamañoMB, tamañoBloque, estrategia, null, true);
+    }
+
+    private static void prepararImagen(Path archivo, long tamañoMB, int tamañoBloque,
+            int estrategia, char[] contraseña, boolean reemplazar) throws IOException {
+        Path destino = archivo.toAbsolutePath();
+        if (!reemplazar && Files.exists(destino)) {
+            throw new FileAlreadyExistsException(archivo.toString());
+        }
+        String nombre = destino.getFileName().toString();
+        Path directorio = Files.createTempDirectory(destino.getParent(), ".format-");
+        Path nuevo = directorio.resolve(nombre);
+        try {
+            try (discoVirtual disco = new discoVirtual()) {
+                disco.formatear(nombre, tamañoMB, tamañoBloque, estrategia, directorio, contraseña);
+            }
+            if (reemplazar) {
+                Files.move(nuevo, destino, StandardCopyOption.ATOMIC_MOVE,
+                        StandardCopyOption.REPLACE_EXISTING);
+            } else {
+                Files.move(nuevo, destino);
+            }
+        } finally {
+            Files.deleteIfExists(nuevo);
+            Files.deleteIfExists(directorio);
+        }
+    }
+
+    private void formatear(String nombre, long tamañoMB, int tamañoBloque,
+            int estrategia, Path directorio, char[] contraseña) throws IOException {
 
         if (tamañoBloque != 512 &&
                 tamañoBloque != 1024 &&
@@ -173,17 +229,23 @@ public class discoVirtual implements AutoCloseable {
                     "No queda espacio para almacenar archivos");
         }
 
-        long libres = totalBloques - inicioDatos;
-
         long tamañoBitmap = bloquesBitmap * tamañoBloque;
-
         if (tamañoBitmap > Integer.MAX_VALUE) {
-            throw new IllegalArgumentException(
-                    "El bitmap es demasiado grande");
+            throw new IllegalArgumentException("El bitmap es demasiado grande");
+        }
+        byte[] bitmap = new byte[(int) tamañoBitmap];
+        secuencial.marcar(bitmap, 0, inicioDatos, true);
+
+        long primerBloqueInicial = -1;
+        long libres = totalBloques - inicioDatos;
+        if (contraseña != null) {
+            // El HOME vacío tiene un FCB y se le asignarán datos al recibir entradas.
+            primerBloqueInicial = secuencial.reservar(bitmap, inicioDatos, totalBloques, 3);
+            libres -= 3;
         }
 
         // Crear el archivo físico.
-        crearDisco(nombre, tamañoMB);
+        crearDisco(nombre, tamañoMB, directorio);
 
         // Crear la única partición.
         Particion particion = new Particion(
@@ -220,26 +282,40 @@ public class discoVirtual implements AutoCloseable {
                 disco,
                 particion.getInicioBytes() + TAMAÑO_SECTOR);
 
-        // Crear el bitmap del volumen.
-        byte[] bitmap = new byte[(int) tamañoBitmap];
-
-        // Marcar ocupados todos los bloques reservados
-        // para las estructuras administrativas.
-        for (long i = 0; i < inicioDatos; i++) {
-
-            int byteIndice = (int) (i / 8);
-            int bitIndice = 7 - (int) (i % 8);
-
-            bitmap[byteIndice] |= (byte) (1 << bitIndice);
-        }
-
         long posicionBitmap = particion.getInicioBytes()
                 + inicioBitmap * tamañoBloque;
 
         disco.seek(posicionBitmap);
         disco.write(bitmap);
-
+        if (contraseña != null) {
+            inicializarRaiz(vcb, particion.getInicioBytes(), primerBloqueInicial, contraseña);
+        }
         disco.getFD().sync();
+    }
+
+    private void inicializarRaiz(VolumeControlBlock vcb, long particion,
+            long primerBloque, char[] contraseña) throws IOException {
+        escribirRegistroInicial(vcb, particion, FCB.RAIZ, FCB.DIRECTORIO, 0755,
+                primerBloque, Directorios.codificar(Map.of("root", FCB.HOME_ROOT)));
+        escribirRegistroInicial(vcb, particion, FCB.HOME_ROOT, FCB.DIRECTORIO, 0700,
+                -1, new byte[0]);
+        escribirRegistroInicial(vcb, particion, FCB.USUARIOS, FCB.REGISTRO_INTERNO, 0600,
+                primerBloque + 1, Usuarios.crearRoot(contraseña));
+        escribirRegistroInicial(vcb, particion, FCB.GRUPOS, FCB.REGISTRO_INTERNO, 0600,
+                primerBloque + 2, Grupos.crearRoot());
+    }
+
+    private void escribirRegistroInicial(VolumeControlBlock vcb, long particion,
+            int id, int tipo, int permisos, long bloque, byte[] contenido) throws IOException {
+        int cantidad = contenido.length == 0 ? 0 : 1;
+        if (contenido.length > vcb.getTamañoBloque()) {
+            throw new IOException("El registro inicial supera el tamaño de bloque");
+        }
+        if (cantidad > 0) {
+            escribir(particion + bloque * vcb.getTamañoBloque(), contenido);
+        }
+        new FCB(tipo, Usuarios.ROOT, Grupos.ROOT, permisos, bloque, cantidad, contenido.length)
+                .escribir(this, vcb, particion, id);
     }
 
     public MBR leerMBR() throws IOException {
